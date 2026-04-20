@@ -2,7 +2,7 @@
 --!strict
 
 --------------------------------------------------------------------------------------
---                             RichTextParserUtilities                              --
+--                                  RichTextUtils                                   --
 --                                       v1.0                                       --     
 --																					--
 -- This is a library that offers utilities for iterating over the characters of a	--
