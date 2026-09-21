@@ -3,7 +3,7 @@
 
 --------------------------------------------------------------------------------------
 --                                  RichTextUtils                                   --
---                                       v1.0                                       --     
+--                                       v1.1                                       --     
 --																					--
 -- This is a library that offers utilities for iterating over the characters of a	--
 -- rich text string.																--
@@ -15,6 +15,9 @@
 --			Methods:																--
 --				Length																--
 --				Iterator															--
+--				TagEvents															--
+--				EventIterator														--
+--				PlaybackIterator													--
 --	Functions:																		--
 --		RichTextIterator															--
 --		RichTextLength																--
@@ -22,7 +25,7 @@
 -- Author: razvanpacku/RazvanPacu													--
 -- Contributors: 																	--
 -- Date created: 20.04.2026															--
--- Date updated: 20.04.2026															--
+-- Date updated: 21.09.2026															--
 --------------------------------------------------------------------------------------
 
 local RichTextUtils = {}
@@ -30,18 +33,44 @@ local RichTextUtils = {}
 --=== TYPES ===--
 
 type Token = {
-	Type: "escapse" | "char" | "self",
+	Type: "escape" | "char" | "self",
 	Char: string?,
 	Tags: {string},
 	Tag : string?
 }
 
+export type TagEvent = {
+	Kind: "Entered" | "Closed" | "SelfClosed",
+	Name: string,
+	Properties: {[string]: string},
+	Raw: string,
+}
+
+export type EventItem =
+	{Type: "tag", Event: TagEvent}
+|	{Type: "text", Text: string}
+
+export type PlaybackItem =
+	{Type: "tag", Event: TagEvent}
+| 	{
+	Type: "character",
+	Index: number,
+	Char: string,
+	Current: string,
+	IsLastChar: boolean,
+}
+
 export type RichTextParser = {
 	__tokens: {Token},
+	__tagEvents: {TagEvent},
+	__eventItems: {EventItem},
 	__len: number,
-	
+
 	Length: (self: RichTextParser) -> number,
-	Iterator: (self: RichTextParser) -> (() -> (number?, string?, string))
+	Iterator: (self: RichTextParser) -> (() -> (number?, string?, string)),
+	TagEvents: (self: RichTextParser) -> (() -> TagEvent?),
+	EventIterator: (self: RichTextParser) -> (() -> EventItem?),
+	PlaybackIterator: (self: RichTextParser) -> (() -> PlaybackItem?),
 }
 
 --=== CONSTANTS ===--
@@ -60,83 +89,189 @@ local selfClosingTags : {[string]: string} = {
 	["<br/>"] = "\n",
 }
 
+local function getSelfClosingText(tag: string) : string?
+	local readableText = selfClosingTags[tag]
+	if readableText then
+		return readableText
+	end
+
+	local tagName = tag:match("^<%s*([%w:_-]+)")
+	if tagName == "br" then
+		return "\n"
+	end
+
+	return nil
+end
+
 --=== UTILITY FUNCTIONS ===---
+
+--[[
+	Takes a string alongside a tag kind, and if it is a tag, returns a parsed table of the tag's kind, name and properties; and if not, returns nil.
+	Parameters:
+		@param tag: string - The tag to parse
+		@param kind: "Entered" | "Closed" | "SelfClosed" - The kind of tag to parse
+	Returns:
+		@return tagEvent: TagEvent? - The parsed tag if it is a tag, else nil.
+
+]]
+local function parseTag(tag: string, kind: "Entered" | "Closed" | "SelfClosed") : TagEvent?
+	local _, name, attributeText = tag:match("^<%s*(/?)%s*([%w:_-]+)(.-)>$")
+	if not name then
+		return nil
+	end
+
+	local properties : {[string]: string} = {}
+	local position = 1
+	local attributes: string = attributeText or ""
+	if kind == "SelfClosed" then
+		attributes = attributes:gsub("/%s*$", "")
+	end
+
+	while position <= #attributes do
+		local whitespaceEnd = attributes:find("%S", position)
+		if not whitespaceEnd then
+			break
+		end
+		position = whitespaceEnd
+
+		local propertyName, propertyEnd = attributes:match("([%w:_-]+)()", position)
+		if not propertyName or not propertyEnd then
+			break
+		end
+		position = propertyEnd
+
+		local equalsStart = attributes:find("%S", position)
+		local propertyValue = ""
+		if equalsStart and attributes:sub(equalsStart, equalsStart) == "=" then
+			position = equalsStart + 1
+			local valueStart = attributes:find("%S", position)
+			if valueStart then
+				position = valueStart
+				local quote = attributes:sub(position, position)
+				if quote == "\"" or quote == "'" then
+					local valueEnd = attributes:find(quote, position + 1, true)
+					if valueEnd then
+						propertyValue = attributes:sub(position + 1, valueEnd - 1)
+						position = valueEnd + 1
+					else
+						propertyValue = attributes:sub(position + 1)
+						position = #attributes + 1
+					end
+				else
+					local valueEnd = attributes:find("%s", position)
+					if valueEnd then
+						propertyValue = attributes:sub(position, valueEnd - 1)
+						position = valueEnd
+					else
+						propertyValue = attributes:sub(position)
+						position = #attributes + 1
+					end
+				end
+			end
+		end
+
+		properties[propertyName] = propertyValue
+	end
+
+	return {
+		Kind = kind,
+		Name = name,
+		Properties = properties,
+		Raw = tag,
+	}
+end
 
 --[[
 	Takes a rich text string, and returns an ordered list of the tokens it's made up of, alongside the number of readable tokens (characters, escape sequences and some self closing tags)
 	
 	Parameters:
 		@param text: string - the string to be parsed
-	Return:
+	Returns:
 		@return tokens: {Token} - ordered list of the tokens the string is made up of
 		@return readableTokenCount: number - number of readable tokens
 ]]
-local function ParseRichText(text: string) : ({Token}, number)
+local function ParseRichText(text: string) : ({Token}, number, {TagEvent}, {EventItem})
 	local tokens : {Token} = {}
+	local tagEvents : {TagEvent} = {}
+	local eventItems : {EventItem} = {}
 	local stack : {string} = {}
-	
+
 	local charTokenCount : number = 0
-	
+
 	local nextValidPosition : number = 1
-	
+
 	for first, last in utf8.graphemes(text) do
 		if first < nextValidPosition then continue end
-		
+
 		local char = text:sub(first, last)
-		
+
 		--==== ESCAPE SEQUENCES ====--
 		local matchedEscape : boolean = false
-		for escape, _ in pairs(escapes) do
+		for escape, _ in escapes do
 			if text:sub(first, first + #escape -1) == escape then
 				table.insert (tokens, {
 					Type = "escape",
 					Char = escape,
 					Tags = table.clone(stack)
 				} :: Token)
+				table.insert(eventItems, {Type = "text", Text = escapes[escape]})
 				nextValidPosition = first + #escape
 				matchedEscape = true
 				break
 			end
 		end
 		if matchedEscape then continue end
-		
+
 		--=== TAGS ===---
 		if char == "<" then
 			local tag = text:match("^<[^>]->", first)
 			if tag then
+				local tagKind : "Entered" | "Closed" | "SelfClosed"
 				--self closing tag
-				if tag:sub(-2) == "/>" then
+				if tag:match("/%s*>$") then
+					tagKind = "SelfClosed"
 					table.insert(tokens, {
 						Type = "self",
 						Tag = tag,
 						Tags = table.clone(stack)
 					} :: Token)
-				-- closing tag
+					-- closing tag
 				elseif tag:sub(1, 2) == "</" then
+					tagKind = "Closed"
 					table.remove(stack)
-				-- opening tag
+					-- opening tag
 				else
+					tagKind = "Entered"
 					table.insert(stack, tag)
 				end
-				
+
+				local parsedTag = parseTag(tag, tagKind)
+				if parsedTag then
+					table.insert(tagEvents, parsedTag)
+					table.insert(eventItems, {Type = "tag", Event = parsedTag})
+				end
+
 				nextValidPosition = first + #tag
-				if selfClosingTags[tag] then
+				local readableSelfClosingText = getSelfClosingText(tag)
+				if readableSelfClosingText then
 					charTokenCount += 1
+					table.insert(eventItems, {Type = "text", Text = readableSelfClosingText})
 				end
 				continue
 			end
 		end
-		
+
 		--=== NORMAL CHARACTERS ===--
 		table.insert(tokens, {
 			Type = "char",
 			Char = char,
 			Tags = table.clone(stack)
 		} :: Token)
+		table.insert(eventItems, {Type = "text", Text = char})
 		charTokenCount += 1
 	end
-	
-	return tokens, charTokenCount
+
+	return tokens, charTokenCount, tagEvents, eventItems
 end
 
 --[[
@@ -237,24 +372,24 @@ function _RichTextIterator_helper(tokens : {Token}) : () -> (number?, string?, s
 		if token.Type == "char" then
 			syncTags(token.Tags)
 
-			buffer[#buffer+1] = token.Char
+			buffer[#buffer+1] = token.Char :: string
 			tokenIndex += 1
 
 			return tokenIndex, token.Char, buildCurrentString()
 		elseif token.Type == "escape" then
 			syncTags(token.Tags)
 
-			buffer[#buffer+1] = token.Char
+			buffer[#buffer+1] = token.Char :: string
 
-			return tokenIndex, escapes[token.Char], buildCurrentString()
+			return tokenIndex, escapes[token.Char :: string] :: string, buildCurrentString()
 		elseif token.Type == "self" then
 			syncTags(token.Tags)
 
-			buffer[#buffer+1] = token.Tag
+			buffer[#buffer+1] = token.Tag :: string
 
 			local charToReturn = ""
-			if token.Tag and selfClosingTags[token.Tag] then
-				charToReturn = selfClosingTags[token.Tag]
+			if token.Tag and getSelfClosingText(token.Tag) then
+				charToReturn = getSelfClosingText(token.Tag) :: string
 				tokenIndex += 1
 			end
 
@@ -322,12 +457,14 @@ RichTextParser.__index = RichTextParser
 ]]
 function RichTextParser.new(text: string) : RichTextParser
 	local self = setmetatable({}, RichTextParser)
-	
-	local t, l = ParseRichText(text)
+
+	local t, l, tagEvents, eventItems = ParseRichText(text)
 	self.__tokens = t
+	self.__tagEvents = tagEvents
+	self.__eventItems = eventItems
 	self.__len = l
-	
-	return self :: RichTextParser
+
+	return (self :: any) :: RichTextParser
 end
 
 --[[
@@ -348,6 +485,81 @@ end
 ]]
 function RichTextParser.Iterator(self: RichTextParser) : () -> (number, string, string)
 	return _RichTextIterator_helper(self.__tokens) :: () -> (number, string, string)
+end
+
+--[[
+	Returns a new iterator over tag lifecycle events in source order.
+	The returned events include the tag name, raw tag text, and parsed properties.
+
+	Returns:
+		@return iterator: () -> TagEvent? - iterator function that returns tag events in source order
+]]
+function RichTextParser.TagEvents(self: RichTextParser) : () -> TagEvent?
+	local index = 0
+	return function() : TagEvent?
+		index += 1
+		return self.__tagEvents[index]
+	end
+end
+
+--[[
+	Returns a new iterator over tag events and readable text in source order.
+	Tag events are returned before the text that follows them.
+
+	Returns:
+		@return iterator: () -> EventItem? - iterator function that returns tag events and text in source order
+]]
+function RichTextParser.EventIterator(self: RichTextParser) : () -> EventItem?
+	local index = 0
+	return function() : EventItem?
+		index += 1
+		return self.__eventItems[index]
+	end
+end
+
+--[[
+	Returns a new iterator over tag events and readable characters in source order.
+	Tag events are returned before the character or readable self-closing tag that follows them.
+
+	Parameters:
+		@param self: RichTextParser - The parser whose text should be iterated
+	Returns:
+		@return iterator: () -> PlaybackItem? - An iterator that returns tag events and character data
+		@return item: PlaybackItem? - A tag event, or a character with its formatted text and last-character state
+]]
+function RichTextParser.PlaybackIterator(self: RichTextParser) : () -> PlaybackItem?
+	local eventIndex = 0
+	local readableIndex = 0
+	local textIterator = _RichTextIterator_helper(self.__tokens)
+
+	return function() : PlaybackItem?
+		eventIndex += 1
+		local eventItem = self.__eventItems[eventIndex]
+		if not eventItem then
+			return nil
+		end
+
+		if eventItem.Type == "tag" then
+			if eventItem.Event.Kind == "SelfClosed" then
+				textIterator()
+			end
+			return eventItem
+		end
+
+		local _, character, current = textIterator()
+		if not character or not current then
+			return nil
+		end
+
+		readableIndex += 1
+		return {
+			Type = "character",
+			Index = readableIndex,
+			Char = character,
+			Current = current,
+			IsLastChar = readableIndex == self.__len,
+		}
+	end
 end
 
 RichTextUtils.RichTextParser = RichTextParser
